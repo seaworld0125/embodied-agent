@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from memory import MemoryStore, memory_worker
+
 
 @dataclass(frozen=True)
 class Subscription:
@@ -17,14 +19,23 @@ class Subscription:
 
 
 class EventBus:
-    """Minimal in-process fan-out event bus."""
+    """
+    Minimal in-process fan-out event bus.
+    Each subscriber gets its own queue.
+    """
 
     def __init__(self) -> None:
         self._subscribers: list[Subscription] = []
 
-    def subscribe(self, name: str, maxsize: int = 256) -> asyncio.Queue[dict[str, Any]]:
+    def subscribe(
+        self,
+        name: str,
+        maxsize: int = 256,
+    ) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=maxsize)
-        self._subscribers.append(Subscription(name=name, queue=queue))
+        self._subscribers.append(
+            Subscription(name=name, queue=queue)
+        )
         return queue
 
     async def publish(self, event: dict[str, Any]) -> None:
@@ -83,8 +94,9 @@ async def read_ear_events(
         await bus.publish(event)
 
 
-async def diagnostics_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:
-    """Temporary subscriber used to verify the event bus."""
+async def diagnostics_worker(
+    queue: asyncio.Queue[dict[str, Any]],
+) -> None:
     while True:
         event = await queue.get()
 
@@ -93,13 +105,15 @@ async def diagnostics_worker(queue: asyncio.Queue[dict[str, Any]]) -> None:
                 payload = event.get("payload", {})
                 text = payload.get("text", "")
                 duration = payload.get("duration_ms")
+
                 print(
                     f'[core][speech] "{text}" ({duration} ms)',
                     flush=True,
                 )
             else:
                 print(
-                    f"[core][event] {json.dumps(event, ensure_ascii=False)}",
+                    "[core][event] "
+                    + json.dumps(event, ensure_ascii=False),
                     flush=True,
                 )
         finally:
@@ -136,9 +150,13 @@ def build_parser() -> argparse.ArgumentParser:
     home = Path.home()
 
     parser = argparse.ArgumentParser(
-        description="little-agent core: launches sensory processes and routes events"
+        description=(
+            "little-agent core: launches sensory processes, "
+            "routes events, and persists memory"
+        )
     )
-    parser.add_argument("--ear", default="./little_agent_ear.py")
+
+    parser.add_argument("--ear", default="./ear.py")
     parser.add_argument(
         "--whisper",
         default=str(home / "whisper.cpp/build/bin/whisper-cli"),
@@ -147,10 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=str(home / "whisper.cpp/models/ggml-small.bin"),
     )
+    parser.add_argument(
+        "--memory-db",
+        default="./data/agent.db",
+    )
     parser.add_argument("--language", default="ko")
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--device", default=None)
-
     parser.add_argument("--vad-threshold", type=float, default=0.5)
     parser.add_argument("--min-silence-ms", type=int, default=600)
     parser.add_argument("--speech-pad-ms", type=int, default=200)
@@ -161,13 +182,21 @@ def build_parser() -> argparse.ArgumentParser:
 async def run(args: argparse.Namespace) -> None:
     ear_path = Path(args.ear).expanduser().resolve()
     if not ear_path.exists():
-        raise SystemExit(f"ear file not found: {ear_path}")
+        raise SystemExit(f"ear.py not found: {ear_path}")
+
+    store = MemoryStore(args.memory_db)
+    await asyncio.to_thread(store.initialize)
+
+    print(
+        f"[core] memory db: {store.db_path}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     bus = EventBus()
 
-    # First subscriber: human-readable diagnostics.
-    # Next step can add MemoryWorker as another subscriber.
     diagnostics_queue = bus.subscribe("diagnostics")
+    memory_queue = bus.subscribe("memory", maxsize=1024)
 
     command = build_ear_command(args)
 
@@ -195,13 +224,19 @@ async def run(args: argparse.Namespace) -> None:
             diagnostics_worker(diagnostics_queue),
             name="diagnostics",
         ),
+        asyncio.create_task(
+            memory_worker(memory_queue, store),
+            name="memory",
+        ),
     ]
 
     try:
         return_code = await process.wait()
 
         if return_code != 0:
-            raise RuntimeError(f"ear process exited with code {return_code}")
+            raise RuntimeError(
+                f"ear process exited with code {return_code}"
+            )
 
     finally:
         if process.returncode is None:
