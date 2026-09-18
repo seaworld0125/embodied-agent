@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     ended_at TEXT,
     event_count INTEGER NOT NULL DEFAULT 0,
     summary TEXT,
+    consolidation_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -73,8 +74,17 @@ class MemoryStore:
     """
     SQLite-backed memory store.
 
-    Raw events are append-only.
-    Episodes are temporal groupings over raw events.
+    events:
+      immutable raw experiences
+
+    episodes:
+      temporal grouping of events
+
+    episodes.summary:
+      compact human-readable Korean summary
+
+    episodes.consolidation_json:
+      structured memory metadata such as topics, facts and importance
     """
 
     def __init__(self, db_path: str | Path) -> None:
@@ -90,7 +100,25 @@ class MemoryStore:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """
+        Lightweight forward-only migrations for existing agent.db files.
+        """
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(episodes)"
+            ).fetchall()
+        }
+
+        if "consolidation_json" not in columns:
+            conn.execute(
+                "ALTER TABLE episodes "
+                "ADD COLUMN consolidation_json TEXT"
+            )
 
     def append_event(self, event: dict[str, Any]) -> None:
         required = ("id", "type", "source", "occurred_at", "payload")
@@ -327,7 +355,8 @@ class MemoryStore:
                     last_event_at,
                     ended_at,
                     event_count,
-                    summary
+                    summary,
+                    consolidation_json
                 FROM episodes
                 ORDER BY started_at DESC
                 LIMIT ?
@@ -335,7 +364,22 @@ class MemoryStore:
                 (limit,),
             ).fetchall()
 
-        return [dict(row) for row in reversed(rows)]
+        result: list[dict[str, Any]] = []
+
+        for row in reversed(rows):
+            item = dict(row)
+            raw = item.get("consolidation_json")
+            if raw:
+                try:
+                    item["consolidation"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    item["consolidation"] = None
+            else:
+                item["consolidation"] = None
+
+            result.append(item)
+
+        return result
 
     def episode_events(
         self,
