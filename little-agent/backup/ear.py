@@ -19,11 +19,12 @@ from stt import (
     Utterance,
     WhisperConfig,
     WhisperSTTWorker,
+    make_failed_event,
     publish_jsonl,
 )
 
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16_000
 CHUNK_SIZE = 512
 PRE_ROLL_MS = 250
 AUDIO_QUEUE_MAX = 512
@@ -39,6 +40,7 @@ def monotonic_ms() -> int:
 
 
 def log(message: str) -> None:
+    # stdout is reserved for machine-readable JSONL.
     print(message, file=sys.stderr, flush=True)
 
 
@@ -48,21 +50,68 @@ def normalize_device(value: str | None):
     return int(value) if value.isdigit() else value
 
 
+def speech_started_event(
+    utterance_id: str,
+    started_at: str,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "id": str(uuid4()),
+        "type": "speech.started",
+        "source": "ear",
+        "occurred_at": started_at,
+        "started_at": started_at,
+        "ended_at": None,
+        "payload": {
+            "utterance_id": utterance_id,
+        },
+    }
+
+
+def speech_ended_event(
+    utterance_id: str,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int,
+    reason: str,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "id": str(uuid4()),
+        "type": "speech.ended",
+        "source": "ear",
+        "occurred_at": ended_at,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "payload": {
+            "utterance_id": utterance_id,
+            "duration_ms": duration_ms,
+            "reason": reason,
+        },
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     home = Path.home()
+
     parser = argparse.ArgumentParser(
         description=(
-            "Async Ear: continuous microphone/VAD capture "
-            "with background whisper.cpp transcription"
+            "Continuous microphone/VAD capture with asynchronous "
+            "whisper.cpp transcription"
         )
     )
+
     parser.add_argument(
         "--whisper",
-        default=str(home / "whisper.cpp/build/bin/whisper-cli"),
+        default=str(
+            home / "whisper.cpp/build/bin/whisper-cli"
+        ),
     )
     parser.add_argument(
         "--model",
-        default=str(home / "whisper.cpp/models/ggml-small.bin"),
+        default=str(
+            home / "whisper.cpp/models/ggml-small.bin"
+        ),
     )
     parser.add_argument("--language", default="ko")
     parser.add_argument("--threads", type=int, default=6)
@@ -76,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_STT_QUEUE_MAX,
     )
+
     return parser
 
 
@@ -86,10 +136,14 @@ def main() -> None:
     model_path = Path(args.model).expanduser().resolve()
 
     if not whisper_cli.exists():
-        raise SystemExit(f"whisper-cli not found: {whisper_cli}")
+        raise SystemExit(
+            f"whisper-cli not found: {whisper_cli}"
+        )
 
     if not model_path.exists():
-        raise SystemExit(f"whisper model not found: {model_path}")
+        raise SystemExit(
+            f"whisper model not found: {model_path}"
+        )
 
     device = normalize_device(args.device)
 
@@ -114,16 +168,24 @@ def main() -> None:
 
     dropped_audio_chunks = 0
 
-    def audio_callback(indata, frames, time_info, status):
+    def audio_callback(
+        indata,
+        frames,
+        time_info,
+        status,
+    ):
         nonlocal dropped_audio_chunks
 
         if status:
             log(f"[ear][audio] {status}")
 
         try:
-            audio_queue.put_nowait(indata[:, 0].copy())
+            audio_queue.put_nowait(
+                indata[:, 0].copy()
+            )
         except queue.Full:
             dropped_audio_chunks += 1
+
             if dropped_audio_chunks % 50 == 1:
                 log(
                     "[ear] audio queue overflow "
@@ -131,6 +193,7 @@ def main() -> None:
                 )
 
     log("[ear] loading Silero VAD...")
+
     vad_model = load_silero_vad()
     vad = VADIterator(
         vad_model,
@@ -142,9 +205,15 @@ def main() -> None:
 
     pre_roll_chunks = max(
         1,
-        int((PRE_ROLL_MS / 1000) * SAMPLE_RATE / CHUNK_SIZE),
+        int(
+            (PRE_ROLL_MS / 1000)
+            * SAMPLE_RATE
+            / CHUNK_SIZE
+        ),
     )
-    pre_roll = deque(maxlen=pre_roll_chunks)
+    pre_roll = deque(
+        maxlen=pre_roll_chunks
+    )
 
     recording = False
     utterance_chunks: list[np.ndarray] = []
@@ -173,6 +242,7 @@ def main() -> None:
         ):
             while True:
                 chunk = audio_queue.get()
+
                 vad_event = vad(
                     torch.from_numpy(chunk),
                     return_seconds=False,
@@ -181,7 +251,11 @@ def main() -> None:
                 if not recording:
                     pre_roll.append(chunk)
 
-                if vad_event and "start" in vad_event and not recording:
+                if (
+                    vad_event
+                    and "start" in vad_event
+                    and not recording
+                ):
                     recording = True
                     utterance_id = str(uuid4())
                     started_at = utc_now_iso()
@@ -189,7 +263,18 @@ def main() -> None:
                     utterance_chunks = list(pre_roll)
                     pre_roll.clear()
 
-                    log(f"[ear] speech:start id={utterance_id}")
+                    publish_jsonl(
+                        speech_started_event(
+                            utterance_id,
+                            started_at,
+                        )
+                    )
+
+                    log(
+                        f"[ear] speech:start "
+                        f"id={utterance_id}"
+                    )
+
                     continue
 
                 if recording:
@@ -199,8 +284,10 @@ def main() -> None:
                     recording
                     and started_monotonic is not None
                     and (
-                        time.monotonic() - started_monotonic
-                    ) >= args.max_utterance_sec
+                        time.monotonic()
+                        - started_monotonic
+                    )
+                    >= args.max_utterance_sec
                 )
 
                 ended_by_vad = bool(
@@ -209,33 +296,68 @@ def main() -> None:
                     and recording
                 )
 
-                if not (ended_by_vad or reached_max):
+                if not (
+                    ended_by_vad
+                    or reached_max
+                ):
                     continue
 
                 ended_at = utc_now_iso()
+
                 duration_ms = int(
                     (
                         time.monotonic()
-                        - (started_monotonic or time.monotonic())
+                        - (
+                            started_monotonic
+                            or time.monotonic()
+                        )
                     )
                     * 1000
                 )
 
                 audio = (
-                    np.concatenate(utterance_chunks)
+                    np.concatenate(
+                        utterance_chunks
+                    )
                     if utterance_chunks
-                    else np.array([], dtype=np.float32)
+                    else np.array(
+                        [],
+                        dtype=np.float32,
+                    )
                 )
 
-                finished_id = utterance_id or str(uuid4())
-                started_at_value = started_at or ended_at
+                finished_id = (
+                    utterance_id
+                    or str(uuid4())
+                )
+                started_at_value = (
+                    started_at
+                    or ended_at
+                )
+                reason = (
+                    "max-duration"
+                    if reached_max
+                    else "vad"
+                )
+
+                # Physical speech end is published before STT begins.
+                publish_jsonl(
+                    speech_ended_event(
+                        utterance_id=finished_id,
+                        started_at=started_at_value,
+                        ended_at=ended_at,
+                        duration_ms=duration_ms,
+                        reason=reason,
+                    )
+                )
 
                 log(
-                    f"[ear] speech:end id={finished_id} "
-                    f"reason={'max-duration' if reached_max else 'vad'}"
+                    f"[ear] speech:end "
+                    f"id={finished_id} "
+                    f"reason={reason}"
                 )
 
-                # Reset immediately. No STT work happens on this path.
+                # Reset the sensory path immediately.
                 recording = False
                 utterance_chunks = []
                 utterance_id = None
@@ -243,30 +365,49 @@ def main() -> None:
                 started_monotonic = None
                 pre_roll.clear()
 
-                if audio.size == 0:
-                    vad.reset_states()
-                    continue
-
                 item = Utterance(
                     id=finished_id,
                     audio=audio,
                     started_at=started_at_value,
                     ended_at=ended_at,
                     duration_ms=duration_ms,
-                    enqueued_monotonic_ms=monotonic_ms(),
+                    enqueued_monotonic_ms=(
+                        monotonic_ms()
+                    ),
                 )
+
+                if audio.size == 0:
+                    publish_jsonl(
+                        make_failed_event(
+                            item,
+                            reason="empty_audio",
+                        )
+                    )
+                    vad.reset_states()
+                    continue
 
                 try:
                     stt_queue.put_nowait(item)
+
                     log(
-                        f"[ear] queued stt id={finished_id} "
+                        f"[ear] queued stt "
+                        f"id={finished_id} "
                         f"pending={stt_queue.qsize()}"
                     )
+
                 except queue.Full:
-                    # Preserve sensory-loop liveness over blocking.
+                    # Never block sensory capture because STT is behind.
+                    publish_jsonl(
+                        make_failed_event(
+                            item,
+                            reason="stt_queue_full",
+                        )
+                    )
+
                     log(
                         "[ear] STT QUEUE FULL: "
-                        f"dropped utterance id={finished_id}"
+                        f"dropped utterance "
+                        f"id={finished_id}"
                     )
 
                 vad.reset_states()
