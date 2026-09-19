@@ -453,7 +453,7 @@ class RollingMemoryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LLMBrokerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_background_priority_rolling_before_final(self) -> None:
+    async def test_priority_order_realtime_then_rolling_then_final(self) -> None:
         broker = LLMRequestBroker(base_url="http://unused", model="test")
         call_order: list[str] = []
 
@@ -488,18 +488,27 @@ class LLMBrokerTests(unittest.IsolatedAsyncioTestCase):
                     label="rolling",
                 )
             )
+            realtime_task = asyncio.create_task(
+                broker.complete(
+                    [{"role": "user", "content": "realtime"}],
+                    priority=PRIORITY_REALTIME,
+                    label="realtime",
+                )
+            )
 
+            # Enqueue all requests before the worker starts consuming.
             await asyncio.sleep(0)
-            self.assertEqual(broker.queue.qsize(), 2)
+            self.assertEqual(broker.queue.qsize(), 3)
 
             worker = asyncio.create_task(broker.worker())
             results = await asyncio.gather(
+                realtime_task,
                 rolling_task,
                 final_task,
             )
 
-            self.assertEqual(results, ["rolling", "final"])
-            self.assertEqual(call_order, ["rolling", "final"])
+            self.assertEqual(results, ["realtime", "rolling", "final"])
+            self.assertEqual(call_order, ["realtime", "rolling", "final"])
 
             worker.cancel()
             with self.assertRaises(asyncio.CancelledError):

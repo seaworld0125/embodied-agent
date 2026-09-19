@@ -6,6 +6,7 @@ import itertools
 import json
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Any
 
 
 PRIORITY_REALTIME = 0
@@ -64,27 +65,22 @@ class _QueuedRequest:
 
 class LLMRequestBroker:
     """
-    Two logical lanes over one llama-server.
+    One local model, multiple cognitive workloads.
 
-    Realtime lane:
-      - reasoning requests bypass the background queue
-      - may execute concurrently with background work
-      - bounded by realtime_concurrency to avoid runaway stale generations
+    Lower priority number wins:
+      0  realtime reasoning (reserved for later)
+      10 rolling working-memory consolidation
+      20 final long-term consolidation
 
-    Background lane:
-      - rolling/final requests use a PriorityQueue
-      - rolling wins over final
-      - new background work does not start while realtime is already active
-
-    For real latency isolation, run llama-server with at least two parallel slots,
-    e.g. `-np 2`. A request already executing cannot be preempted by this client.
+    V1 intentionally executes one request at a time. This prevents background
+    memory work from saturating a 16 GB edge machine. Later, this can be
+    replaced with multiple llama-server slots without changing callers.
     """
 
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8080",
         model: str = "local",
-        realtime_concurrency: int = 2,
     ) -> None:
         self.base_url = base_url
         self.model = model
@@ -92,16 +88,6 @@ class LLMRequestBroker:
             asyncio.PriorityQueue()
         )
         self._counter = itertools.count()
-        self._realtime_slots = asyncio.Semaphore(
-            max(1, realtime_concurrency)
-        )
-        self._realtime_active = 0
-        self._realtime_idle = asyncio.Event()
-        self._realtime_idle.set()
-
-    @property
-    def realtime_active(self) -> int:
-        return self._realtime_active
 
     async def complete(
         self,
@@ -113,15 +99,6 @@ class LLMRequestBroker:
         max_tokens: int = 1024,
         timeout_sec: float = 120.0,
     ) -> str:
-        if priority <= PRIORITY_REALTIME:
-            return await self._complete_realtime(
-                messages=messages,
-                label=label,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout_sec=timeout_sec,
-            )
-
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
 
@@ -140,45 +117,11 @@ class LLMRequestBroker:
 
         return await future
 
-    async def _complete_realtime(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        label: str,
-        temperature: float,
-        max_tokens: int,
-        timeout_sec: float,
-    ) -> str:
-        async with self._realtime_slots:
-            self._realtime_active += 1
-            self._realtime_idle.clear()
-            try:
-                return await asyncio.to_thread(
-                    post_chat_completion,
-                    self.base_url,
-                    self.model,
-                    messages,
-                    timeout_sec,
-                    temperature,
-                    max_tokens,
-                )
-            finally:
-                self._realtime_active -= 1
-                if self._realtime_active <= 0:
-                    self._realtime_active = 0
-                    self._realtime_idle.set()
-
     async def worker(self) -> None:
-        """Background lane worker for rolling/final requests."""
         while True:
             request = await self.queue.get()
 
             try:
-                # Prefer not to start a new background generation while the
-                # realtime lane is already occupied. If realtime arrives after
-                # this check, both are allowed to run concurrently.
-                await self._realtime_idle.wait()
-
                 result = await asyncio.to_thread(
                     post_chat_completion,
                     self.base_url,

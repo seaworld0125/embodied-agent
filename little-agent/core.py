@@ -13,7 +13,9 @@ from consolidation import final_consolidation_worker
 from episode import ActiveEpisodeManager
 from llm_client import LLMRequestBroker
 from memory import MemoryStore, persistence_worker
+from reasoner import RealtimeReasoner
 from rolling import RollingMemoryService
+from turn import TurnCoordinator
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,7 @@ async def read_ear_events(
         if not isinstance(event, dict) or "type" not in event:
             continue
 
-        # Realtime path: only RAM state mutation + put_nowait queues.
+        # Realtime path: RAM mutation + put_nowait queues only.
         await episode_manager.handle(event)
 
 
@@ -130,6 +132,21 @@ async def diagnostics_worker(
                     f"[core][speech:failed] episode={episode} "
                     f"seq={seq} pos={position} "
                     f"reason={payload.get('reason')}",
+                    flush=True,
+                )
+            elif event_type == "agent.intent":
+                print(
+                    f"[core][agent:intent] episode={episode} "
+                    f"based_on={payload.get('based_on_utterance_seq')} "
+                    f'"{payload.get("response", "")}"',
+                    flush=True,
+                )
+            elif event_type == "reasoner.failed":
+                print(
+                    f"[core][reasoner:failed] episode={episode} "
+                    f"based_on={payload.get('based_on_utterance_seq')} "
+                    f"{payload.get('error_type')}: {payload.get('error')}",
+                    file=sys.stderr,
                     flush=True,
                 )
         finally:
@@ -189,6 +206,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--llm-url", default="http://127.0.0.1:8080")
     parser.add_argument("--llm-model", default="local")
+    parser.add_argument("--llm-realtime-concurrency", type=int, default=2)
+
+    parser.add_argument("--turn-grace-ms", type=int, default=500)
+    parser.add_argument("--reasoner-temperature", type=float, default=0.4)
+    parser.add_argument("--reasoner-max-tokens", type=int, default=512)
+    parser.add_argument("--reasoner-timeout-sec", type=float, default=60.0)
+
     parser.add_argument("--rolling-batch", type=int, default=3)
     parser.add_argument("--rolling-delay-sec", type=float, default=8.0)
     parser.add_argument("--final-poll-sec", type=float, default=3.0)
@@ -206,8 +230,19 @@ async def run(args: argparse.Namespace) -> None:
         flush=True,
     )
     print(
+        f"[core] turn grace: {args.turn_grace_ms}ms",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
         f"[core] rolling: batch={args.rolling_batch} "
         f"delay={args.rolling_delay_sec}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        "[core] LLM lanes: realtime + background. "
+        "For real concurrency, run llama-server with -np 2 or more.",
         file=sys.stderr,
         flush=True,
     )
@@ -215,8 +250,8 @@ async def run(args: argparse.Namespace) -> None:
     bus = EventBus()
     diagnostics_queue = bus.subscribe("diagnostics")
     rolling_event_queue = bus.subscribe("rolling", maxsize=512)
+    turn_event_queue = bus.subscribe("turns", maxsize=512)
 
-    # Realtime episode assignment never waits for SQLite.
     persistence_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     episode_manager = ActiveEpisodeManager(
@@ -230,7 +265,23 @@ async def run(args: argparse.Namespace) -> None:
     broker = LLMRequestBroker(
         base_url=args.llm_url,
         model=args.llm_model,
+        realtime_concurrency=args.llm_realtime_concurrency,
     )
+
+    reasoner = RealtimeReasoner(
+        store=store,
+        broker=broker,
+        temperature=args.reasoner_temperature,
+        max_tokens=args.reasoner_max_tokens,
+        timeout_sec=args.reasoner_timeout_sec,
+    )
+    turns = TurnCoordinator(
+        reasoner=reasoner,
+        event_queue=turn_event_queue,
+        publish=bus.publish,
+        grace_ms=args.turn_grace_ms,
+    )
+
     rolling = RollingMemoryService(
         store=store,
         broker=broker,
@@ -270,7 +321,11 @@ async def run(args: argparse.Namespace) -> None:
         ),
         asyncio.create_task(
             broker.worker(),
-            name="llm-broker",
+            name="llm-background-lane",
+        ),
+        asyncio.create_task(
+            turns.event_loop(),
+            name="turn-coordinator",
         ),
         asyncio.create_task(
             rolling.event_loop(),
