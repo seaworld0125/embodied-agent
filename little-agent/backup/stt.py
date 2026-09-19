@@ -11,14 +11,11 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from typing import Callable
 from uuid import uuid4
 
 import numpy as np
-
-
-_STDOUT_LOCK = Lock()
 
 
 def utc_now_iso() -> str:
@@ -49,17 +46,10 @@ class WhisperConfig:
     model: Path
     language: str = "ko"
     threads: int = 6
-    sample_rate: int = 16_000
+    sample_rate: int = 16000
 
 
 class WhisperSTTWorker:
-    """
-    Background STT worker.
-
-    Capture/VAD never waits for this worker. Results are correlated back to
-    the physical utterance by utterance_id.
-    """
-
     def __init__(
         self,
         config: WhisperConfig,
@@ -98,13 +88,6 @@ class WhisperSTTWorker:
                     f"[stt] failed utterance={utterance.id}: "
                     f"{type(exc).__name__}: {exc}"
                 )
-                self.publish(
-                    make_failed_event(
-                        utterance,
-                        reason="stt_error",
-                        detail=f"{type(exc).__name__}: {exc}",
-                    )
-                )
             finally:
                 self.utterance_queue.task_done()
 
@@ -136,13 +119,18 @@ class WhisperSTTWorker:
             monotonic_ms() - stt_started_ms,
         )
 
+        if not text:
+            log(
+                f"[stt] empty id={utterance.id} "
+                f"latency={stt_latency_ms}ms"
+            )
+            return
+
         event = {
             "schema_version": 1,
             "id": str(uuid4()),
-            "type": "speech.final",
+            "type": "speech",
             "source": "ear",
-            # The perceived event happened when the utterance ended.
-            # STT completion time is carried separately in the payload.
             "occurred_at": utterance.ended_at,
             "started_at": utterance.started_at,
             "ended_at": utterance.ended_at,
@@ -167,36 +155,7 @@ class WhisperSTTWorker:
         )
 
 
-def make_failed_event(
-    utterance: Utterance,
-    reason: str,
-    detail: str | None = None,
-) -> dict:
-    payload = {
-        "utterance_id": utterance.id,
-        "duration_ms": utterance.duration_ms,
-        "reason": reason,
-    }
-
-    if detail:
-        payload["detail"] = detail[:500]
-
-    return {
-        "schema_version": 1,
-        "id": str(uuid4()),
-        "type": "speech.failed",
-        "source": "ear",
-        "occurred_at": utterance.ended_at,
-        "started_at": utterance.started_at,
-        "ended_at": utterance.ended_at,
-        "payload": payload,
-    }
-
-
-def transcribe(
-    audio: np.ndarray,
-    config: WhisperConfig,
-) -> str:
+def transcribe(audio: np.ndarray, config: WhisperConfig) -> str:
     with tempfile.NamedTemporaryFile(
         suffix=".wav",
         delete=False,
@@ -204,23 +163,15 @@ def transcribe(
         wav_path = Path(tmp.name)
 
     try:
-        write_wav(
-            audio=audio,
-            path=wav_path,
-            sample_rate=config.sample_rate,
-        )
+        write_wav(audio, wav_path, config.sample_rate)
 
         result = subprocess.run(
             [
                 str(config.whisper_cli),
-                "-m",
-                str(config.model),
-                "-f",
-                str(wav_path),
-                "-l",
-                config.language,
-                "-t",
-                str(config.threads),
+                "-m", str(config.model),
+                "-f", str(wav_path),
+                "-l", config.language,
+                "-t", str(config.threads),
                 "-nt",
                 "-np",
             ],
@@ -239,18 +190,13 @@ def transcribe(
             for line in result.stdout.splitlines()
             if line.strip()
         ]
-
         return " ".join(lines).strip()
 
     finally:
         wav_path.unlink(missing_ok=True)
 
 
-def write_wav(
-    audio: np.ndarray,
-    path: Path,
-    sample_rate: int,
-) -> None:
+def write_wav(audio: np.ndarray, path: Path, sample_rate: int) -> None:
     pcm = np.clip(audio, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
 
@@ -262,13 +208,11 @@ def write_wav(
 
 
 def publish_jsonl(event: dict) -> None:
-    encoded = json.dumps(
-        event,
-        ensure_ascii=False,
-        separators=(",", ":"),
+    print(
+        json.dumps(
+            event,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        flush=True,
     )
-
-    # Capture/VAD and STT publish from different threads.
-    # Serialize stdout so one JSONL event always stays on one line.
-    with _STDOUT_LOCK:
-        print(encoded, flush=True)

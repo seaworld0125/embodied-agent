@@ -76,6 +76,7 @@ def fetch_unconsolidated_episode_ids(
             SELECT id
             FROM episodes
             WHERE status = 'closed'
+              AND ready_for_consolidation = 1
               AND (
                     consolidation_json IS NULL
                     OR TRIM(consolidation_json) = ''
@@ -103,7 +104,8 @@ def get_episode_metadata(
                 ended_at,
                 event_count,
                 summary,
-                consolidation_json
+                consolidation_json,
+                ready_for_consolidation
             FROM episodes
             WHERE id = ?
             """,
@@ -148,25 +150,66 @@ def save_consolidation(
         conn.commit()
 
 
-def event_to_line(event: dict[str, Any]) -> str:
-    event_type = event.get("type", "unknown")
-    source = event.get("source", "unknown")
-    occurred_at = event.get("occurred_at", "")
-    payload = event.get("payload", {})
+def event_to_line(
+    event: dict[str, Any],
+) -> str | None:
+    event_type = event.get(
+        "type",
+        "unknown",
+    )
+    source = event.get(
+        "source",
+        "unknown",
+    )
+    occurred_at = event.get(
+        "occurred_at",
+        "",
+    )
+    payload = event.get(
+        "payload",
+        {},
+    )
 
-    if event_type == "speech":
-        text = payload.get("text", "")
-        duration = payload.get("duration_ms")
+    # Lifecycle markers define episode timing but are not semantic
+    # conversation content.
+    if event_type in (
+        "speech.started",
+        "speech.ended",
+    ):
+        return None
+
+    if event_type in (
+        "speech.final",
+        "speech",
+    ):
+        text = payload.get(
+            "text",
+            "",
+        )
+        duration = payload.get(
+            "duration_ms"
+        )
 
         return (
             f"- [{occurred_at}] "
-            f"source={source} type=speech "
-            f"duration_ms={duration}: {text}"
+            f"source={source} "
+            f"type={event_type} "
+            f"duration_ms={duration}: "
+            f"{text}"
+        )
+
+    if event_type == "speech.failed":
+        return (
+            f"- [{occurred_at}] "
+            "음성 발화가 있었지만 "
+            "STT 인식에 실패함 "
+            f"reason={payload.get('reason')}"
         )
 
     return (
         f"- [{occurred_at}] "
-        f"source={source} type={event_type}: "
+        f"source={source} "
+        f"type={event_type}: "
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -175,9 +218,18 @@ def build_user_prompt(
     episode: dict[str, Any],
     events: list[dict[str, Any]],
 ) -> str:
-    event_lines = "\n".join(
-        event_to_line(event)
+    semantic_lines = [
+        line
         for event in events
+        if (
+            line := event_to_line(
+                event
+            )
+        )
+    ]
+
+    event_lines = "\n".join(
+        semantic_lines
     )
 
     return f"""다음 에피소드를 consolidation 하라.

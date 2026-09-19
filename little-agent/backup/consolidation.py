@@ -19,22 +19,30 @@ SYSTEM_PROMPT = """너는 이 에이전트 자신의 기억을 정리하는 내�
 주어진 에피소드는 에이전트가 실제로 경험한 raw event들이다.
 너의 역할은 이 경험을 미래에 다시 사용할 수 있는 기억으로 압축하는 것이다.
 
-규칙:
+핵심 규칙:
 - 주어진 이벤트에 없는 사실을 추측하지 마라.
 - 일시적인 사실과 지속적으로 유용한 사실을 구분하라.
-- 사용자의 말은 사용자가 당시 그렇게 말했다는 사실로 취급하라.
+- 사용자의 말은 "사용자가 당시 그렇게 말했다"는 사실로 취급하라.
 - 확실하지 않은 내용은 confidence를 낮춰라.
 - 감정, 선호, 관계, 목표를 근거 없이 만들어내지 마라.
 - 결과는 반드시 JSON object 하나만 출력하라.
 - 마크다운 코드펜스는 사용하지 마라.
 
+언어 규칙:
+- JSON key는 아래에 지정된 영문 key를 그대로 사용한다.
+- summary 값은 반드시 자연스러운 한국어로 작성한다.
+- topics 배열의 모든 값은 반드시 한국어로 작성한다.
+- facts[].text의 모든 값은 반드시 한국어로 작성한다.
+- unresolved 배열의 모든 값은 반드시 한국어로 작성한다.
+- 제품명, 프로젝트명, API명, 라이브러리명 등 고유명사/기술 용어를 제외하고 영어 문장을 사용하지 마라.
+
 출력 형식:
 {
-  "summary": "이 에피소드의 핵심을 1~3문장으로 요약",
+  "summary": "이 에피소드의 핵심을 한국어 1~3문장으로 요약",
   "topics": ["주제1", "주제2"],
   "facts": [
     {
-      "text": "미래에 유용할 수 있는 사실",
+      "text": "미래에 유용할 수 있는 사실을 한국어로 작성",
       "stability": 0.0,
       "confidence": 0.0
     }
@@ -68,7 +76,10 @@ def fetch_unconsolidated_episode_ids(
             SELECT id
             FROM episodes
             WHERE status = 'closed'
-              AND (summary IS NULL OR TRIM(summary) = '')
+              AND (
+                    consolidation_json IS NULL
+                    OR TRIM(consolidation_json) = ''
+                  )
             ORDER BY started_at ASC
             LIMIT ?
             """,
@@ -90,7 +101,9 @@ def get_episode_metadata(
                 status,
                 started_at,
                 ended_at,
-                event_count
+                event_count,
+                summary,
+                consolidation_json
             FROM episodes
             WHERE id = ?
             """,
@@ -105,6 +118,10 @@ def save_consolidation(
     episode_id: str,
     result: dict[str, Any],
 ) -> None:
+    summary_text = str(
+        result.get("summary", "")
+    ).strip()
+
     encoded = json.dumps(
         result,
         ensure_ascii=False,
@@ -117,11 +134,13 @@ def save_consolidation(
             UPDATE episodes
             SET
                 summary = ?,
+                consolidation_json = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND status = 'closed'
             """,
             (
+                summary_text,
                 encoded,
                 episode_id,
             ),
@@ -138,6 +157,7 @@ def event_to_line(event: dict[str, Any]) -> str:
     if event_type == "speech":
         text = payload.get("text", "")
         duration = payload.get("duration_ms")
+
         return (
             f"- [{occurred_at}] "
             f"source={source} type=speech "
@@ -197,7 +217,10 @@ def post_chat_completion(
         "max_tokens": 1024,
     }
 
-    data = json.dumps(body).encode("utf-8")
+    data = json.dumps(
+        body,
+        ensure_ascii=False,
+    ).encode("utf-8")
 
     request = urllib.request.Request(
         url,
@@ -249,9 +272,6 @@ def strip_code_fence(text: str) -> str:
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    """
-    Prefer strict JSON, but tolerate Qwen-style prose/thinking around it.
-    """
     cleaned = strip_code_fence(text)
 
     try:
@@ -261,7 +281,6 @@ def extract_json_object(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # Remove common visible thinking blocks if they appear.
     cleaned = re.sub(
         r"<think>.*?</think>",
         "",
@@ -328,6 +347,7 @@ def normalize_result(
         for item in facts_raw:
             if isinstance(item, str):
                 text = item.strip()
+
                 if text:
                     facts.append(
                         {
@@ -336,6 +356,7 @@ def normalize_result(
                             "confidence": 0.5,
                         }
                     )
+
                 continue
 
             if not isinstance(item, dict):
@@ -456,6 +477,11 @@ async def consolidate_episode(
             parsed
         )
 
+        if not normalized["summary"]:
+            raise ValueError(
+                "model returned an empty summary"
+            )
+
         await asyncio.to_thread(
             save_consolidation,
             store,
@@ -467,7 +493,8 @@ async def consolidate_episode(
             f"[consolidation] done "
             f"id={episode_id} "
             f"importance="
-            f"{normalized['importance']:.2f}"
+            f"{normalized['importance']:.2f} "
+            f'summary="{normalized["summary"]}"'
         )
 
         return True
@@ -497,12 +524,11 @@ async def consolidation_worker(
     temperature: float = 0.2,
 ) -> None:
     """
-    Continuously consolidates closed episodes whose summary is still empty.
+    Consolidate closed episodes whose consolidation_json is still empty.
 
-    It is intentionally polling-based in V1:
-    - EpisodeBuilder owns episode lifecycle.
-    - ConsolidationWorker only observes durable DB state.
-    - If core crashes/restarts, unconsolidated episodes remain discoverable.
+    DB polling is intentional:
+    - episode lifecycle remains owned by EpisodeBuilder
+    - unfinished consolidation survives process restarts
     """
 
     log(
@@ -534,7 +560,6 @@ async def consolidation_worker(
             )
 
             if not success:
-                # Avoid hammering a down LLM server.
                 await asyncio.sleep(
                     poll_interval_sec
                 )
