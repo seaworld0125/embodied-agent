@@ -16,6 +16,7 @@ from memory import MemoryStore, persistence_worker
 from reasoner import RealtimeReasoner
 from rolling import RollingMemoryService
 from turn import TurnCoordinator
+from tts import MacOSSayTTS
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,29 @@ async def diagnostics_worker(
                     file=sys.stderr,
                     flush=True,
                 )
+            elif event_type == "agent.speech.started":
+                print(
+                    f"[core][agent:speech:start] episode={episode} "
+                    f"action={str(payload.get('action_id', ''))[:8]} "
+                    f'"{payload.get("text", "")}"',
+                    flush=True,
+                )
+            elif event_type == "agent.speech.ended":
+                print(
+                    f"[core][agent:speech:end] episode={episode} "
+                    f"action={str(payload.get('action_id', ''))[:8]} "
+                    f"status={payload.get('status')} "
+                    f"duration={payload.get('duration_ms')}ms",
+                    flush=True,
+                )
+            elif event_type == "agent.speech.failed":
+                print(
+                    f"[core][agent:speech:failed] episode={episode} "
+                    f"action={str(payload.get('action_id', ''))[:8]} "
+                    f"{payload.get('error_type')}: {payload.get('error')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         finally:
             queue.task_done()
 
@@ -213,6 +237,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoner-max-tokens", type=int, default=512)
     parser.add_argument("--reasoner-timeout-sec", type=float, default=60.0)
 
+    parser.add_argument("--tts-command", default="/usr/bin/say")
+    parser.add_argument("--tts-voice", default=None)
+    parser.add_argument("--tts-rate", type=int, default=None)
+    parser.add_argument(
+        "--no-tts",
+        action="store_false",
+        dest="tts_enabled",
+        help="Disable macOS say output while keeping agent.intent generation.",
+    )
+    parser.set_defaults(tts_enabled=True)
+
     parser.add_argument("--rolling-batch", type=int, default=3)
     parser.add_argument("--rolling-delay-sec", type=float, default=8.0)
     parser.add_argument("--final-poll-sec", type=float, default=3.0)
@@ -251,6 +286,7 @@ async def run(args: argparse.Namespace) -> None:
     diagnostics_queue = bus.subscribe("diagnostics")
     rolling_event_queue = bus.subscribe("rolling", maxsize=512)
     turn_event_queue = bus.subscribe("turns", maxsize=512)
+    tts_event_queue = bus.subscribe("tts", maxsize=512)
 
     persistence_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
@@ -278,7 +314,9 @@ async def run(args: argparse.Namespace) -> None:
     turns = TurnCoordinator(
         reasoner=reasoner,
         event_queue=turn_event_queue,
-        publish=bus.publish,
+        # Reasoner outputs become part of the agent's durable episode history
+        # before being fanned out to the rest of the runtime.
+        publish=episode_manager.publish_internal_event,
         grace_ms=args.turn_grace_ms,
     )
 
@@ -288,6 +326,22 @@ async def run(args: argparse.Namespace) -> None:
         event_queue=rolling_event_queue,
         batch_size=args.rolling_batch,
         max_delay_sec=args.rolling_delay_sec,
+    )
+
+    tts = MacOSSayTTS(
+        event_queue=tts_event_queue,
+        publish=episode_manager.publish_internal_event,
+        command=args.tts_command,
+        voice=args.tts_voice,
+        rate=args.tts_rate,
+        enabled=args.tts_enabled,
+    )
+    print(
+        f"[core] TTS: {'enabled' if args.tts_enabled else 'disabled'} "
+        f"command={args.tts_command} voice={args.tts_voice or 'system'} "
+        f"rate={args.tts_rate or 'system'}",
+        file=sys.stderr,
+        flush=True,
     )
 
     process = await asyncio.create_subprocess_exec(
@@ -328,6 +382,10 @@ async def run(args: argparse.Namespace) -> None:
             name="turn-coordinator",
         ),
         asyncio.create_task(
+            tts.event_loop(),
+            name="tts",
+        ),
+        asyncio.create_task(
             rolling.event_loop(),
             name="rolling-events",
         ),
@@ -354,6 +412,8 @@ async def run(args: argparse.Namespace) -> None:
         if return_code != 0:
             raise RuntimeError(f"ear process exited with code {return_code}")
     finally:
+        await tts.close()
+
         if process.returncode is None:
             process.terminate()
             try:

@@ -259,6 +259,120 @@ class MemoryStore:
 
             conn.commit()
 
+    def persist_attached_event(
+        self,
+        event: dict[str, Any],
+        episode_id: str,
+        utterance_seq: int | None = None,
+        touch_activity: bool = False,
+    ) -> int | None:
+        """Persist an event and attach it at the next episode position.
+
+        Used for late internal/action events whose in-memory EpisodeRuntime has
+        already been released. Position allocation and insertion happen in one
+        SQLite transaction. Returns the assigned position, or None when the
+        target episode no longer exists (the raw event is still preserved).
+        """
+        required = ("id", "type", "source", "occurred_at", "payload")
+        missing = [key for key in required if key not in event]
+        if missing:
+            raise ValueError(f"missing required event fields: {missing}")
+
+        payload_json = json.dumps(
+            event["payload"], ensure_ascii=False, separators=(",", ":")
+        )
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM episodes WHERE id=?",
+                (episode_id,),
+            ).fetchone()
+
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO events (
+                        id, schema_version, type, source, occurred_at,
+                        started_at, ended_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event["id"],
+                        int(event.get("schema_version", 1)),
+                        event["type"],
+                        event["source"],
+                        event["occurred_at"],
+                        event.get("started_at"),
+                        event.get("ended_at"),
+                        payload_json,
+                    ),
+                )
+                conn.commit()
+                return None
+
+            position_row = conn.execute(
+                """
+                SELECT COALESCE(MAX(position), -1) + 1 AS next_position
+                FROM episode_events
+                WHERE episode_id=?
+                """,
+                (episode_id,),
+            ).fetchone()
+            position = int(position_row["next_position"])
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                    id, schema_version, type, source, occurred_at,
+                    started_at, ended_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["id"],
+                    int(event.get("schema_version", 1)),
+                    event["type"],
+                    event["source"],
+                    event["occurred_at"],
+                    event.get("started_at"),
+                    event.get("ended_at"),
+                    payload_json,
+                ),
+            )
+
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO episode_events (
+                    episode_id, event_id, position, utterance_seq
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (episode_id, event["id"], position, utterance_seq),
+            )
+
+            if cursor.rowcount:
+                if touch_activity:
+                    conn.execute(
+                        """
+                        UPDATE episodes
+                        SET last_event_at=?, event_count=event_count+1,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                        """,
+                        (event["occurred_at"], episode_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE episodes
+                        SET event_count=event_count+1,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                        """,
+                        (episode_id,),
+                    )
+
+            conn.commit()
+            return position
+
     def append_event(self, event: dict[str, Any]) -> None:
         self.persist_event(event, None, None, None, False)
 
@@ -562,6 +676,14 @@ async def persistence_worker(
                     command["event"],
                     command.get("episode_id"),
                     command.get("position"),
+                    command.get("utterance_seq"),
+                    bool(command.get("touch_activity", False)),
+                )
+            elif op == "persist_attached_event":
+                await asyncio.to_thread(
+                    store.persist_attached_event,
+                    command["event"],
+                    command["episode_id"],
                     command.get("utterance_seq"),
                     bool(command.get("touch_activity", False)),
                 )

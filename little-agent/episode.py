@@ -35,6 +35,7 @@ class EpisodeRuntime:
     next_position: int = 0
     next_utterance_seq: int = 0
     active_utterances: set[str] = field(default_factory=set)
+    active_agent_actions: set[str] = field(default_factory=set)
     pending_finals: set[str] = field(default_factory=set)
     closed: bool = False
 
@@ -136,6 +137,93 @@ class ActiveEpisodeManager:
             )
             await self.publish(event)
 
+    async def publish_internal_event(
+        self,
+        event: dict[str, Any],
+    ) -> None:
+        """Persist and publish agent/internal events.
+
+        Cognitive events such as agent.intent and reasoner.failed do not extend
+        the interaction timeout. Physical agent speech does: while the agent is
+        audibly speaking, the current episode stays alive, and the 15s idle
+        clock restarts when speech ends or fails.
+
+        While an episode runtime is still resident, position allocation stays
+        in RAM so it cannot collide with sensory events already queued for
+        persistence. If runtime state has been released, the persistence worker
+        attaches the late event at the next DB position without reopening the
+        closed episode.
+        """
+        episode_id_raw = event.get("episode_id")
+        episode_id = str(episode_id_raw) if episode_id_raw else None
+        enriched = dict(event)
+        event_type = str(enriched.get("type", ""))
+        is_physical_agent_speech = event_type in {
+            "agent.speech.started",
+            "agent.speech.ended",
+            "agent.speech.failed",
+        }
+
+        if episode_id is None:
+            self._persist_event(
+                event=enriched,
+                episode_id=None,
+                position=None,
+                utterance_seq=None,
+                touch_activity=False,
+            )
+            await self.publish(enriched)
+            return
+
+        state = self.states.get(episode_id)
+        if state is not None:
+            touch_activity = is_physical_agent_speech and not state.closed
+            if touch_activity:
+                self._apply_agent_action_lifecycle(state, enriched)
+
+            enriched["episode_position"] = state.next_position
+            enriched["utterance_seq"] = None
+            state.next_position += 1
+
+            self._persist_event(
+                event=enriched,
+                episode_id=episode_id,
+                position=enriched["episode_position"],
+                utterance_seq=None,
+                touch_activity=touch_activity,
+            )
+        else:
+            # Late cognitive/action events remain part of the historical
+            # episode, but a closed episode is never reopened or extended.
+            self.persistence_queue.put_nowait(
+                {
+                    "op": "persist_attached_event",
+                    "event": enriched,
+                    "episode_id": episode_id,
+                    "utterance_seq": None,
+                    "touch_activity": False,
+                }
+            )
+
+        await self.publish(enriched)
+
+    def _apply_agent_action_lifecycle(
+        self,
+        state: EpisodeRuntime,
+        event: dict[str, Any],
+    ) -> None:
+        event_type = str(event.get("type", ""))
+        action_id = str(event.get("payload", {}).get("action_id", ""))
+
+        if event_type == "agent.speech.started" and action_id:
+            state.active_agent_actions.add(action_id)
+        elif event_type in ("agent.speech.ended", "agent.speech.failed"):
+            if action_id:
+                state.active_agent_actions.discard(action_id)
+
+        state.last_activity_at = event["occurred_at"]
+        state.last_activity_monotonic = time.monotonic()
+
     async def idle_loop(self) -> None:
         interval = min(0.25, max(0.05, self.idle_timeout_sec / 10.0))
         while True:
@@ -143,7 +231,7 @@ class ActiveEpisodeManager:
             state = self.active
             if state is None:
                 continue
-            if state.active_utterances:
+            if state.active_utterances or state.active_agent_actions:
                 continue
 
             idle_for = time.monotonic() - state.last_activity_monotonic
