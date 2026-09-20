@@ -13,6 +13,17 @@ PRIORITY_ROLLING = 10
 PRIORITY_FINAL = 20
 
 
+class EmptyLLMContentError(RuntimeError):
+    def __init__(self, *, finish_reason: str | None, reasoning_content: str | None) -> None:
+        snippet = (reasoning_content or "").strip().replace("\n", " ")[:240]
+        detail = f" finish_reason={finish_reason!r}"
+        if snippet:
+            detail += f" reasoning={snippet!r}"
+        super().__init__("llama-server returned empty content;" + detail)
+        self.finish_reason = finish_reason
+        self.reasoning_content = reasoning_content
+
+
 def post_chat_completion(
     base_url: str,
     model: str,
@@ -20,14 +31,22 @@ def post_chat_completion(
     timeout_sec: float,
     temperature: float,
     max_tokens: int,
+    enable_thinking: bool | None = None,
 ) -> str:
     url = base_url.rstrip("/") + "/v1/chat/completions"
-    body = {
+    body: dict[str, object] = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if enable_thinking is not None:
+        # llama.cpp forwards this to Qwen3's chat template. Keeping it
+        # request-scoped lets fast S2 run non-thinking while memory workers
+        # can still use thinking mode on the same server.
+        body["chat_template_kwargs"] = {
+            "enable_thinking": bool(enable_thinking),
+        }
 
     request = urllib.request.Request(
         url,
@@ -43,9 +62,17 @@ def post_chat_completion(
     if not choices:
         raise RuntimeError(f"llama-server returned no choices: {payload}")
 
-    content = (choices[0].get("message") or {}).get("content")
+    choice = choices[0]
+    message = choice.get("message") or {}
+    content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError(f"llama-server returned empty content: {payload}")
+        reasoning_content = message.get("reasoning_content")
+        raise EmptyLLMContentError(
+            finish_reason=choice.get("finish_reason"),
+            reasoning_content=(
+                reasoning_content if isinstance(reasoning_content, str) else None
+            ),
+        )
 
     return content.strip()
 
@@ -60,24 +87,15 @@ class _QueuedRequest:
     max_tokens: int = field(compare=False)
     timeout_sec: float = field(compare=False)
     label: str = field(compare=False)
+    enable_thinking: bool | None = field(compare=False, default=None)
 
 
 class LLMRequestBroker:
-    """
-    Two logical lanes over one llama-server.
+    """Two logical lanes over one llama-server.
 
-    Realtime lane:
-      - reasoning requests bypass the background queue
-      - may execute concurrently with background work
-      - bounded by realtime_concurrency to avoid runaway stale generations
-
-    Background lane:
-      - rolling/final requests use a PriorityQueue
-      - rolling wins over final
-      - new background work does not start while realtime is already active
-
-    For real latency isolation, run llama-server with at least two parallel slots,
-    e.g. `-np 2`. A request already executing cannot be preempted by this client.
+    Realtime requests bypass the background priority queue. Rolling/final
+    remain serialized in priority order. Thinking mode is request-scoped, so
+    all lanes can share one Qwen3 llama-server without one global switch.
     """
 
     def __init__(
@@ -88,13 +106,9 @@ class LLMRequestBroker:
     ) -> None:
         self.base_url = base_url
         self.model = model
-        self.queue: asyncio.PriorityQueue[_QueuedRequest] = (
-            asyncio.PriorityQueue()
-        )
+        self.queue: asyncio.PriorityQueue[_QueuedRequest] = asyncio.PriorityQueue()
         self._counter = itertools.count()
-        self._realtime_slots = asyncio.Semaphore(
-            max(1, realtime_concurrency)
-        )
+        self._realtime_slots = asyncio.Semaphore(max(1, realtime_concurrency))
         self._realtime_active = 0
         self._realtime_idle = asyncio.Event()
         self._realtime_idle.set()
@@ -112,6 +126,7 @@ class LLMRequestBroker:
         temperature: float = 0.2,
         max_tokens: int = 1024,
         timeout_sec: float = 120.0,
+        enable_thinking: bool | None = None,
     ) -> str:
         if priority <= PRIORITY_REALTIME:
             return await self._complete_realtime(
@@ -120,11 +135,11 @@ class LLMRequestBroker:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
+                enable_thinking=enable_thinking,
             )
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
-
         await self.queue.put(
             _QueuedRequest(
                 priority=priority,
@@ -135,9 +150,9 @@ class LLMRequestBroker:
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
                 label=label,
+                enable_thinking=enable_thinking,
             )
         )
-
         return await future
 
     async def _complete_realtime(
@@ -148,7 +163,9 @@ class LLMRequestBroker:
         temperature: float,
         max_tokens: int,
         timeout_sec: float,
+        enable_thinking: bool | None,
     ) -> str:
+        del label
         async with self._realtime_slots:
             self._realtime_active += 1
             self._realtime_idle.clear()
@@ -161,6 +178,7 @@ class LLMRequestBroker:
                     timeout_sec,
                     temperature,
                     max_tokens,
+                    enable_thinking,
                 )
             finally:
                 self._realtime_active -= 1
@@ -169,16 +187,10 @@ class LLMRequestBroker:
                     self._realtime_idle.set()
 
     async def worker(self) -> None:
-        """Background lane worker for rolling/final requests."""
         while True:
             request = await self.queue.get()
-
             try:
-                # Prefer not to start a new background generation while the
-                # realtime lane is already occupied. If realtime arrives after
-                # this check, both are allowed to run concurrently.
                 await self._realtime_idle.wait()
-
                 result = await asyncio.to_thread(
                     post_chat_completion,
                     self.base_url,
@@ -187,14 +199,12 @@ class LLMRequestBroker:
                     request.timeout_sec,
                     request.temperature,
                     request.max_tokens,
+                    request.enable_thinking,
                 )
-
                 if not request.future.cancelled():
                     request.future.set_result(result)
-
             except Exception as exc:
                 if not request.future.cancelled():
                     request.future.set_exception(exc)
-
             finally:
                 self.queue.task_done()

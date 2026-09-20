@@ -464,6 +464,7 @@ class LLMBrokerTests(unittest.IsolatedAsyncioTestCase):
             timeout_sec,
             temperature,
             max_tokens,
+            enable_thinking=None,
         ):
             marker = messages[0]["content"]
             call_order.append(marker)

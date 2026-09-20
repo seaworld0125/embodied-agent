@@ -232,6 +232,11 @@ async def consolidate_episode(
     store: MemoryStore,
     broker: LLMRequestBroker,
     episode_id: str,
+    *,
+    temperature: float = 0.15,
+    max_tokens: int = 1024,
+    timeout_sec: float = 120.0,
+    enable_thinking: bool = True,
 ) -> bool:
     episode = await asyncio.to_thread(store.get_episode, episode_id)
     if episode is None:
@@ -269,8 +274,10 @@ async def consolidate_episode(
             ],
             priority=PRIORITY_FINAL,
             label=f"final:{episode_id}",
-            temperature=0.15,
-            max_tokens=1024,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            enable_thinking=enable_thinking,
         )
         normalized = normalize_result(extract_json_object(raw))
         if not normalized["summary"]:
@@ -295,6 +302,11 @@ async def final_consolidation_worker(
     store: MemoryStore,
     broker: LLMRequestBroker,
     poll_interval_sec: float = 3.0,
+    *,
+    temperature: float = 0.15,
+    max_tokens: int = 1024,
+    timeout_sec: float = 120.0,
+    enable_thinking: bool = True,
 ) -> None:
     log("[final] worker started")
     while True:
@@ -308,7 +320,15 @@ async def final_consolidation_worker(
             continue
 
         for episode_id in episode_ids:
-            ok = await consolidate_episode(store, broker, episode_id)
+            ok = await consolidate_episode(
+                store,
+                broker,
+                episode_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_sec=timeout_sec,
+                enable_thinking=enable_thinking,
+            )
             if not ok:
                 await asyncio.sleep(poll_interval_sec)
                 break

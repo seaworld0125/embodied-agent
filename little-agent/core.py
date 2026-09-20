@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from consolidation import final_consolidation_worker
+from config import load_config, value
 from episode import ActiveEpisodeManager
 from llm_client import LLMRequestBroker
 from memory import MemoryStore, persistence_worker
@@ -139,6 +140,7 @@ async def diagnostics_worker(
                 print(
                     f"[core][agent:intent] episode={episode} "
                     f"based_on={payload.get('based_on_utterance_seq')} "
+                    f"mode={payload.get('reasoning_mode', 'fast')} "
                     f'"{payload.get("response", "")}"',
                     flush=True,
                 )
@@ -205,52 +207,165 @@ def build_ear_command(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
-def build_parser() -> argparse.ArgumentParser:
-    home = Path.home()
+def build_parser(
+    config: dict[str, Any],
+    config_path: str = "./config.toml",
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ear", default="./ear.py")
+    parser.add_argument("--config", default=config_path)
+
+    parser.add_argument("--ear", default=value(config, "paths", "ear"))
+    parser.add_argument("--whisper", default=value(config, "paths", "whisper"))
+    parser.add_argument("--model", default=value(config, "paths", "whisper_model"))
+    parser.add_argument("--memory-db", default=value(config, "paths", "memory_db"))
+
     parser.add_argument(
-        "--whisper",
-        default=str(home / "whisper.cpp/build/bin/whisper-cli"),
+        "--episode-idle-sec",
+        type=float,
+        default=value(config, "episode", "idle_sec"),
+    )
+    parser.add_argument("--language", default=value(config, "audio", "language"))
+    parser.add_argument("--threads", type=int, default=value(config, "audio", "threads"))
+    parser.add_argument("--device", default=value(config, "audio", "device"))
+
+    parser.add_argument(
+        "--vad-threshold", type=float, default=value(config, "vad", "threshold")
     )
     parser.add_argument(
-        "--model",
-        default=str(home / "whisper.cpp/models/ggml-small.bin"),
+        "--min-silence-ms", type=int, default=value(config, "vad", "min_silence_ms")
     )
-    parser.add_argument("--memory-db", default="./data/agent.db")
-    parser.add_argument("--episode-idle-sec", type=float, default=15.0)
-    parser.add_argument("--language", default="ko")
-    parser.add_argument("--threads", type=int, default=6)
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--vad-threshold", type=float, default=0.5)
-    parser.add_argument("--min-silence-ms", type=int, default=600)
-    parser.add_argument("--speech-pad-ms", type=int, default=200)
-    parser.add_argument("--max-utterance-sec", type=float, default=20.0)
-    parser.add_argument("--stt-queue-max", type=int, default=8)
-
-    parser.add_argument("--llm-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--llm-model", default="local")
-    parser.add_argument("--llm-realtime-concurrency", type=int, default=2)
-
-    parser.add_argument("--turn-grace-ms", type=int, default=500)
-    parser.add_argument("--reasoner-temperature", type=float, default=0.4)
-    parser.add_argument("--reasoner-max-tokens", type=int, default=512)
-    parser.add_argument("--reasoner-timeout-sec", type=float, default=60.0)
-
-    parser.add_argument("--tts-command", default="/usr/bin/say")
-    parser.add_argument("--tts-voice", default=None)
-    parser.add_argument("--tts-rate", type=int, default=None)
     parser.add_argument(
-        "--no-tts",
-        action="store_false",
-        dest="tts_enabled",
-        help="Disable macOS say output while keeping agent.intent generation.",
+        "--speech-pad-ms", type=int, default=value(config, "vad", "speech_pad_ms")
     )
-    parser.set_defaults(tts_enabled=True)
+    parser.add_argument(
+        "--max-utterance-sec",
+        type=float,
+        default=value(config, "vad", "max_utterance_sec"),
+    )
+    parser.add_argument(
+        "--stt-queue-max", type=int, default=value(config, "vad", "stt_queue_max")
+    )
 
-    parser.add_argument("--rolling-batch", type=int, default=3)
-    parser.add_argument("--rolling-delay-sec", type=float, default=8.0)
-    parser.add_argument("--final-poll-sec", type=float, default=3.0)
+    parser.add_argument("--llm-url", default=value(config, "llm", "url"))
+    parser.add_argument("--llm-model", default=value(config, "llm", "model"))
+    parser.add_argument(
+        "--llm-realtime-concurrency",
+        type=int,
+        default=value(config, "llm", "realtime_concurrency"),
+    )
+
+    parser.add_argument(
+        "--turn-grace-ms", type=int, default=value(config, "turn", "grace_ms")
+    )
+    parser.add_argument(
+        "--reasoner-temperature",
+        type=float,
+        default=value(config, "reasoner", "fast", "temperature"),
+    )
+    parser.add_argument(
+        "--reasoner-max-tokens",
+        type=int,
+        default=value(config, "reasoner", "fast", "max_tokens"),
+    )
+    parser.add_argument(
+        "--reasoner-timeout-sec",
+        type=float,
+        default=value(config, "reasoner", "fast", "timeout_sec"),
+    )
+    parser.add_argument(
+        "--reasoner-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "reasoner", "fast", "thinking"),
+    )
+    parser.add_argument(
+        "--deliberate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "reasoner", "deliberate", "enabled"),
+    )
+    parser.add_argument(
+        "--deliberate-temperature",
+        type=float,
+        default=value(config, "reasoner", "deliberate", "temperature"),
+    )
+    parser.add_argument(
+        "--deliberate-max-tokens",
+        type=int,
+        default=value(config, "reasoner", "deliberate", "max_tokens"),
+    )
+    parser.add_argument(
+        "--deliberate-timeout-sec",
+        type=float,
+        default=value(config, "reasoner", "deliberate", "timeout_sec"),
+    )
+    parser.add_argument(
+        "--deliberate-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "reasoner", "deliberate", "thinking"),
+    )
+
+    parser.add_argument("--tts-command", default=value(config, "tts", "command"))
+    parser.add_argument("--tts-voice", default=value(config, "tts", "voice"))
+    parser.add_argument("--tts-rate", type=int, default=value(config, "tts", "rate"))
+    parser.add_argument(
+        "--tts-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "tts", "enabled"),
+    )
+    # Backward-compatible alias from v5.
+    parser.add_argument("--no-tts", action="store_false", dest="tts_enabled")
+
+    parser.add_argument(
+        "--rolling-batch", type=int, default=value(config, "rolling", "batch")
+    )
+    parser.add_argument(
+        "--rolling-delay-sec",
+        type=float,
+        default=value(config, "rolling", "delay_sec"),
+    )
+    parser.add_argument(
+        "--rolling-temperature",
+        type=float,
+        default=value(config, "rolling", "temperature"),
+    )
+    parser.add_argument(
+        "--rolling-max-tokens",
+        type=int,
+        default=value(config, "rolling", "max_tokens"),
+    )
+    parser.add_argument(
+        "--rolling-timeout-sec",
+        type=float,
+        default=value(config, "rolling", "timeout_sec"),
+    )
+    parser.add_argument(
+        "--rolling-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "rolling", "thinking"),
+    )
+
+    parser.add_argument(
+        "--final-poll-sec", type=float, default=value(config, "final", "poll_sec")
+    )
+    parser.add_argument(
+        "--final-temperature",
+        type=float,
+        default=value(config, "final", "temperature"),
+    )
+    parser.add_argument(
+        "--final-max-tokens",
+        type=int,
+        default=value(config, "final", "max_tokens"),
+    )
+    parser.add_argument(
+        "--final-timeout-sec",
+        type=float,
+        default=value(config, "final", "timeout_sec"),
+    )
+    parser.add_argument(
+        "--final-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=value(config, "final", "thinking"),
+    )
     return parser
 
 
@@ -259,6 +374,7 @@ async def run(args: argparse.Namespace) -> None:
     await asyncio.to_thread(store.initialize)
 
     print(f"[core] memory db: {store.db_path}", file=sys.stderr, flush=True)
+    print(f"[core] config: {args.config}", file=sys.stderr, flush=True)
     print(
         f"[core] episode idle timeout: {args.episode_idle_sec}s",
         file=sys.stderr,
@@ -266,6 +382,14 @@ async def run(args: argparse.Namespace) -> None:
     )
     print(
         f"[core] turn grace: {args.turn_grace_ms}ms",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[core] reasoner fast: thinking={args.reasoner_thinking} "
+        f"tokens={args.reasoner_max_tokens}; deliberate: "
+        f"enabled={args.deliberate_enabled} thinking={args.deliberate_thinking} "
+        f"tokens={args.deliberate_max_tokens}",
         file=sys.stderr,
         flush=True,
     )
@@ -310,6 +434,12 @@ async def run(args: argparse.Namespace) -> None:
         temperature=args.reasoner_temperature,
         max_tokens=args.reasoner_max_tokens,
         timeout_sec=args.reasoner_timeout_sec,
+        thinking=args.reasoner_thinking,
+        deliberate_enabled=args.deliberate_enabled,
+        deliberate_temperature=args.deliberate_temperature,
+        deliberate_max_tokens=args.deliberate_max_tokens,
+        deliberate_timeout_sec=args.deliberate_timeout_sec,
+        deliberate_thinking=args.deliberate_thinking,
     )
     turns = TurnCoordinator(
         reasoner=reasoner,
@@ -326,6 +456,10 @@ async def run(args: argparse.Namespace) -> None:
         event_queue=rolling_event_queue,
         batch_size=args.rolling_batch,
         max_delay_sec=args.rolling_delay_sec,
+        llm_temperature=args.rolling_temperature,
+        llm_max_tokens=args.rolling_max_tokens,
+        llm_timeout_sec=args.rolling_timeout_sec,
+        llm_thinking=args.rolling_thinking,
     )
 
     tts = MacOSSayTTS(
@@ -402,6 +536,10 @@ async def run(args: argparse.Namespace) -> None:
                 store,
                 broker,
                 poll_interval_sec=args.final_poll_sec,
+                temperature=args.final_temperature,
+                max_tokens=args.final_max_tokens,
+                timeout_sec=args.final_timeout_sec,
+                enable_thinking=args.final_thinking,
             ),
             name="final-consolidation",
         ),
@@ -428,7 +566,20 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default="./config.toml")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    config_path = Path(pre_args.config).expanduser()
+    config = load_config(config_path)
+    if not config_path.exists():
+        print(
+            f"[core] config not found: {config_path}; using built-in defaults",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    args = build_parser(config, str(config_path)).parse_args()
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

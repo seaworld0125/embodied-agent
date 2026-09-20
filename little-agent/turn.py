@@ -209,6 +209,7 @@ class TurnCoordinator:
                     episode_id=result.episode_id,
                     based_on_seq=result.based_on_utterance_seq,
                     response=result.response,
+                    reasoning_mode=result.mode,
                 )
             )
 
@@ -229,6 +230,7 @@ class TurnCoordinator:
         episode_id: str,
         based_on_seq: int,
         response: str,
+        reasoning_mode: str,
     ) -> dict[str, Any]:
         now = utc_now_iso()
         return {
@@ -244,6 +246,7 @@ class TurnCoordinator:
                 "intent": "respond",
                 "response": response,
                 "based_on_utterance_seq": based_on_seq,
+                "reasoning_mode": reasoning_mode,
             },
         }
 

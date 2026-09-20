@@ -179,12 +179,20 @@ class RollingMemoryService:
         event_queue: asyncio.Queue[dict[str, Any]],
         batch_size: int = 3,
         max_delay_sec: float = 8.0,
+        llm_temperature: float = 0.15,
+        llm_max_tokens: int = 800,
+        llm_timeout_sec: float = 120.0,
+        llm_thinking: bool = True,
     ) -> None:
         self.store = store
         self.broker = broker
         self.event_queue = event_queue
         self.batch_size = max(1, batch_size)
         self.max_delay_sec = max(0.5, max_delay_sec)
+        self.llm_temperature = llm_temperature
+        self.llm_max_tokens = llm_max_tokens
+        self.llm_timeout_sec = llm_timeout_sec
+        self.llm_thinking = llm_thinking
         self.jobs: asyncio.Queue[str] = asyncio.Queue()
         self.states: dict[str, _EpisodeRollState] = {}
 
@@ -313,8 +321,10 @@ class RollingMemoryService:
             ],
             priority=PRIORITY_ROLLING,
             label=f"rolling:{episode_id}:{target_seq}",
-            temperature=0.15,
-            max_tokens=800,
+            temperature=self.llm_temperature,
+            max_tokens=self.llm_max_tokens,
+            timeout_sec=self.llm_timeout_sec,
+            enable_thinking=self.llm_thinking,
         )
         normalized = normalize_state(extract_json_object(raw))
         if not normalized["summary"]:

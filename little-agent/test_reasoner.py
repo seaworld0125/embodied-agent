@@ -309,6 +309,7 @@ class LLMLaneTests(unittest.IsolatedAsyncioTestCase):
             timeout_sec,
             temperature,
             max_tokens,
+            enable_thinking=None,
         ):
             marker = messages[0]["content"]
             if marker == "background":

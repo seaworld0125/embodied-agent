@@ -5,6 +5,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,12 +14,13 @@ from llm_client import LLMRequestBroker, PRIORITY_REALTIME
 from memory import MemoryStore
 
 
-REASONER_SYSTEM_PROMPT = """너는 embodied agent의 실시간 S2 reasoner다.
+REASONER_SYSTEM_PROMPT = """너는 embodied agent의 빠른 S2 realtime reasoner다.
 
 역할:
 - 현재 외부 화자의 발화와 최신 대화 맥락을 이해한다.
-- 지금 에이전트가 응답해야 하는지 판단한다.
-- 응답한다면 자연스럽고 짧은 한국어 응답 내용을 만든다.
+- 일반적인 대화 turn은 즉시 respond/wait로 처리한다.
+- 복잡한 다단계 추론, 중요한 비교/설계 판단, 또는 짧은 fast pass로 신뢰하기 어려운 문제만 intent=deliberate로 승격한다.
+- 단순 인사, 확인, 짧은 질문, 명확한 사실 응답을 deliberate로 보내지 않는다.
 - DB, episode lifecycle, queue, TTS 프로세스 같은 orchestration을 직접 지시하지 않는다.
 
 세계 모델 규칙:
@@ -38,8 +40,27 @@ context 규칙:
 
 출력 형식:
 {
+  "intent": "respond" | "wait" | "deliberate",
+  "response": "respond일 때 말할 짧은 한국어 문장. wait/deliberate이면 빈 문자열",
+  "reason": "deliberate일 때만 짧은 승격 이유. 그 외에는 빈 문자열"
+}
+"""
+
+DELIBERATE_SYSTEM_PROMPT = """너는 embodied agent의 S2 deliberate reasoner다.
+빠른 S2가 이 turn은 더 깊은 추론이 필요하다고 판단해 승격했다.
+
+역할:
+- 같은 최신 context를 바탕으로 충분히 검토한 뒤 최종 응답을 만든다.
+- working memory보다 최신 raw evidence를 우선한다.
+- 입력에 없는 사실을 만들지 않는다.
+- source=ear 또는 speaker_role=external_speaker는 에이전트가 들은 외부 화자의 발화이며 에이전트 자신의 발화가 아니다.
+- orchestration 명령을 만들지 않는다.
+
+출력은 JSON object 하나만 사용하고 마크다운 코드펜스를 쓰지 마라.
+출력 형식:
+{
   "intent": "respond" | "wait",
-  "response": "respond일 때 말할 한국어 문장. wait이면 빈 문자열"
+  "response": "respond일 때 말할 자연스러운 한국어 응답. wait이면 빈 문자열"
 }
 """
 
@@ -54,6 +75,7 @@ class ReasoningResult:
     based_on_utterance_seq: int
     intent: str
     response: str
+    mode: str = "fast"
 
 
 def log(message: str) -> None:
@@ -99,20 +121,29 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("could not extract JSON object from realtime reasoning output")
 
 
-def normalize_result(value: dict[str, Any]) -> tuple[str, str]:
+def normalize_result(
+    value: dict[str, Any],
+    *,
+    allow_deliberate: bool = False,
+) -> tuple[str, str, str]:
     intent = str(value.get("intent", "")).strip().lower()
     response = str(value.get("response", "")).strip()
+    reason = str(value.get("reason", "")).strip()
 
-    if intent not in {"respond", "wait"}:
+    allowed = {"respond", "wait"}
+    if allow_deliberate:
+        allowed.add("deliberate")
+    if intent not in allowed:
         raise ValueError(f"unsupported reasoner intent: {intent!r}")
 
     if intent == "respond" and not response:
         raise ValueError("reasoner returned respond with empty response")
-
-    if intent == "wait":
+    if intent != "respond":
         response = ""
+    if intent != "deliberate":
+        reason = ""
 
-    return intent, response
+    return intent, response, reason
 
 
 def build_reasoner_prompt(
@@ -121,16 +152,12 @@ def build_reasoner_prompt(
 ) -> str:
     current = utterance_view(current_event)
     current_seq = int(current_event["utterance_seq"])
-
-    # Keep the current utterance explicit even if it is already present in the
-    # raw tail. Older tail items provide immediate turn-local context.
     tail_before_current = [
         item
         for item in context.get("raw_tail", [])
         if isinstance(item.get("utterance_seq"), int)
         and int(item["utterance_seq"]) < current_seq
     ]
-
     view = {
         "episode_id": context["episode_id"],
         "working_memory": context["working_memory"],
@@ -138,7 +165,6 @@ def build_reasoner_prompt(
         "current_utterance": current,
         "precedence_rule": context["precedence_rule"],
     }
-
     return (
         "다음은 현재 interaction의 context snapshot이다.\n"
         "CURRENT UTTERANCE에 대해 지금 응답할지 판단하라.\n"
@@ -147,32 +173,46 @@ def build_reasoner_prompt(
     )
 
 
+def _thinking_control(prompt: str, enabled: bool) -> str:
+    # Qwen3 soft switch. We also send chat_template_kwargs at request level;
+    # keeping both makes behavior robust across llama.cpp versions/templates.
+    return prompt.rstrip() + ("\n\n/think" if enabled else "\n\n/no_think")
+
+
 class RealtimeReasoner:
     def __init__(
         self,
         store: MemoryStore,
         broker: LLMRequestBroker,
         *,
-        temperature: float = 0.4,
-        max_tokens: int = 512,
-        timeout_sec: float = 60.0,
+        temperature: float = 0.30,
+        max_tokens: int = 192,
+        timeout_sec: float = 30.0,
+        thinking: bool = False,
+        deliberate_enabled: bool = True,
+        deliberate_temperature: float = 0.35,
+        deliberate_max_tokens: int = 768,
+        deliberate_timeout_sec: float = 60.0,
+        deliberate_thinking: bool = True,
     ) -> None:
         self.store = store
         self.broker = broker
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout_sec = timeout_sec
+        self.thinking = thinking
+        self.deliberate_enabled = deliberate_enabled
+        self.deliberate_temperature = deliberate_temperature
+        self.deliberate_max_tokens = deliberate_max_tokens
+        self.deliberate_timeout_sec = deliberate_timeout_sec
+        self.deliberate_thinking = deliberate_thinking
 
-    async def reason(
-        self,
-        current_event: dict[str, Any],
-    ) -> ReasoningResult:
+    async def reason(self, current_event: dict[str, Any]) -> ReasoningResult:
         if current_event.get("type") != "speech.final":
             raise ValueError("realtime reasoner requires speech.final")
 
         episode_id = current_event.get("episode_id")
         seq = current_event.get("utterance_seq")
-
         if not episode_id or not isinstance(seq, int):
             raise ValueError("speech.final missing episode_id/utterance_seq")
 
@@ -181,10 +221,7 @@ class RealtimeReasoner:
             self.store,
             str(episode_id),
         )
-
-        fresh_through = int(
-            context.get("fresh_through_utterance_seq", -1)
-        )
+        fresh_through = int(context.get("fresh_through_utterance_seq", -1))
         if fresh_through > seq:
             raise StaleReasoningInput(
                 f"context already contains newer utterance "
@@ -192,36 +229,105 @@ class RealtimeReasoner:
             )
 
         prompt = build_reasoner_prompt(context, current_event)
-
+        started = time.monotonic()
         log(
-            f"[reasoner] start episode={str(episode_id)[:8]} "
-            f"seq={seq} working_upto="
+            f"[reasoner] fast start episode={str(episode_id)[:8]} seq={seq} "
+            f"thinking={self.thinking} working_upto="
             f"{context['working_memory']['authoritative_through_utterance_seq']} "
             f"tail={len(context['raw_tail'])}"
         )
 
         raw = await self.broker.complete(
             [
-                {"role": "system", "content": REASONER_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": _thinking_control(REASONER_SYSTEM_PROMPT, self.thinking),
+                },
                 {"role": "user", "content": prompt},
             ],
             priority=PRIORITY_REALTIME,
-            label=f"realtime:{episode_id}:{seq}",
+            label=f"realtime-fast:{episode_id}:{seq}",
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             timeout_sec=self.timeout_sec,
+            enable_thinking=self.thinking,
         )
+        intent, response, reason = normalize_result(
+            extract_json_object(raw),
+            allow_deliberate=True,
+        )
+        fast_ms = int((time.monotonic() - started) * 1000)
 
-        intent, response = normalize_result(extract_json_object(raw))
+        if intent != "deliberate":
+            log(
+                f"[reasoner] fast done episode={str(episode_id)[:8]} "
+                f"seq={seq} intent={intent} latency={fast_ms}ms"
+            )
+            return ReasoningResult(
+                episode_id=str(episode_id),
+                based_on_utterance_seq=seq,
+                intent=intent,
+                response=response,
+                mode="fast",
+            )
+
+        if not self.deliberate_enabled:
+            log(
+                f"[reasoner] deliberate requested but disabled "
+                f"episode={str(episode_id)[:8]} seq={seq}"
+            )
+            # If escalation is disabled, fail closed to silence rather than
+            # improvising an answer the fast model explicitly distrusted.
+            return ReasoningResult(
+                episode_id=str(episode_id),
+                based_on_utterance_seq=seq,
+                intent="wait",
+                response="",
+                mode="fast",
+            )
 
         log(
-            f"[reasoner] done episode={str(episode_id)[:8]} "
-            f"seq={seq} intent={intent}"
+            f"[reasoner] escalate episode={str(episode_id)[:8]} seq={seq} "
+            f"fast_latency={fast_ms}ms reason={reason[:120]!r}"
         )
-
+        deliberate_prompt = (
+            prompt
+            + "\n\nFAST PASS ESCALATION REASON:\n"
+            + (reason or "빠른 판단에서 더 깊은 추론이 필요하다고 판단됨")
+            + "\n\n이제 최종 respond 또는 wait만 결정하라. deliberate를 다시 출력하지 마라."
+        )
+        deep_started = time.monotonic()
+        deep_raw = await self.broker.complete(
+            [
+                {
+                    "role": "system",
+                    "content": _thinking_control(
+                        DELIBERATE_SYSTEM_PROMPT,
+                        self.deliberate_thinking,
+                    ),
+                },
+                {"role": "user", "content": deliberate_prompt},
+            ],
+            priority=PRIORITY_REALTIME,
+            label=f"realtime-deliberate:{episode_id}:{seq}",
+            temperature=self.deliberate_temperature,
+            max_tokens=self.deliberate_max_tokens,
+            timeout_sec=self.deliberate_timeout_sec,
+            enable_thinking=self.deliberate_thinking,
+        )
+        deep_intent, deep_response, _ = normalize_result(
+            extract_json_object(deep_raw),
+            allow_deliberate=False,
+        )
+        deep_ms = int((time.monotonic() - deep_started) * 1000)
+        log(
+            f"[reasoner] deliberate done episode={str(episode_id)[:8]} "
+            f"seq={seq} intent={deep_intent} latency={deep_ms}ms"
+        )
         return ReasoningResult(
             episode_id=str(episode_id),
             based_on_utterance_seq=seq,
-            intent=intent,
-            response=response,
+            intent=deep_intent,
+            response=deep_response,
+            mode="deliberate",
         )

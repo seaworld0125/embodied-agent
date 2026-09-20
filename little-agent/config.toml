@@ -1,0 +1,69 @@
+# Embodied Agent runtime configuration
+# CLI flags still work and override these values for one run.
+
+[paths]
+ear = "./ear.py"
+whisper = "~/whisper.cpp/build/bin/whisper-cli"
+whisper_model = "~/whisper.cpp/models/ggml-small.bin"
+memory_db = "./data/agent.db"
+
+[audio]
+language = "ko"
+threads = 6
+# device = "MacBook Microphone"  # or numeric device id
+
+[vad]
+# Higher = less sensitive. Start around 0.65-0.70 for a noisy desk setup.
+threshold = 0.70
+min_silence_ms = 600
+speech_pad_ms = 200
+max_utterance_sec = 20.0
+stt_queue_max = 8
+
+[episode]
+idle_sec = 15.0
+
+[llm]
+url = "http://127.0.0.1:8080"
+model = "local"
+realtime_concurrency = 2
+
+[turn]
+# Wait briefly after speech.final before assuming the external speaker yielded.
+grace_ms = 300
+
+[reasoner.fast]
+# Fast S2 path: handles normal conversational turns.
+temperature = 0.30
+max_tokens = 192
+timeout_sec = 30.0
+thinking = false
+
+[reasoner.deliberate]
+# Escalation path: used only when the fast pass judges that deeper reasoning is useful.
+enabled = true
+temperature = 0.35
+max_tokens = 768
+timeout_sec = 60.0
+thinking = true
+
+[rolling]
+batch = 3
+delay_sec = 8.0
+temperature = 0.15
+max_tokens = 800
+timeout_sec = 120.0
+thinking = true
+
+[final]
+poll_sec = 3.0
+temperature = 0.15
+max_tokens = 1024
+timeout_sec = 120.0
+thinking = true
+
+[tts]
+enabled = true
+command = "/usr/bin/say"
+# voice = "Yuna"
+# rate = 180
